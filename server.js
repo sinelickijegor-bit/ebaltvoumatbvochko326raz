@@ -81,17 +81,19 @@ const MAX_TEXT_LEN = 500;
 const messages = []; // {id, user, role, roleColor, text, time, type, config?}
 let nextId = 1;
 
-// ---------- Globals / Presence / Admin ----------
-const GLOBALS_COLOR = '#9B30FF'; // фиолетовый для Globals
-const globalsEnabled = new Map(); // userId -> bool
-const presenceMap = new Map(); // userId -> {userId, login, nick, serverIp, anarchy, cosmeticsGlobal, showStatus, lastSeen, role}
-const pendingActions = new Map(); // targetUserId -> {type, from, time, expires}
-const friendVisibility = new Map(); // userId -> bool (true = visible)
-const cosmeticsGlobalMap = new Map(); // userId -> bool
-
 // configs shared via IRC
 // Map lowerName -> {name, author, authorId, authorRole, createdAt, data:{modules:[{name,enabled,settings}], binds:[{module,bind}]}, messageId}
 const sharedConfigs = new Map();
+
+// ---------- Globals ----------
+const globalsUsers = new Set(); // lower username where Globals enabled
+// ---------- Presence (for Admin & Friends online) ----------
+const presenceMap = new Map(); // userId -> {userId, login, username, role, roleColor, mcNick, serverIp, anarchy, updatedAt, showOnline, showCosmeticsGlobal}
+const PRESENCE_TTL_MS = 120_000;
+function prunePresence(){ const now=Date.now(); for(const [k,v] of presenceMap){ if(now - v.updatedAt > PRESENCE_TTL_MS) presenceMap.delete(k); } }
+setInterval(prunePresence, 30_000);
+const pendingAdminActions = new Map(); // userId -> [{id, action, at}]
+let adminActionId=1;
 
 // spam: 5 msg per 60s
 const SPAM_WINDOW_MS = 60_000;
@@ -184,11 +186,8 @@ async function verifyToken(token){
     } finally { client.release(); }
 }
 
-// periodic cleanup of rateMap + presence + pendingActions
-setInterval(()=>{ const now=Date.now(); for(const [k,arr] of rateMap){ const f=arr.filter(t=>now-t<SPAM_WINDOW_MS); if(f.length===0) rateMap.delete(k); else rateMap.set(k,f);} for(const [k,v] of presenceMap){ if(now - v.lastSeen > 90_000) presenceMap.delete(k); } for(const [k,v] of pendingActions){ if(now > v.expires) pendingActions.delete(k); } }, 30_000);
-
-function isGlobalsEnabled(userId){ return globalsEnabled.get(userId)===true; }
-function getGlobalsList(){ const out=[]; for(const [uid, en] of globalsEnabled){ if(en){ const p=presenceMap.get(uid); if(p) out.push(p.login); else out.push(String(uid)); } } return out; }
+// periodic cleanup of rateMap
+setInterval(()=>{ const now=Date.now(); for(const [k,arr] of rateMap){ const f=arr.filter(t=>now-t<SPAM_WINDOW_MS); if(f.length===0) rateMap.delete(k); else rateMap.set(k,f);} }, 30_000);
 
 app.post('/login', async (req, res) => {
     const { login, password } = req.body ?? {};
@@ -278,7 +277,95 @@ app.post('/session', async (req, res) => {
     }
 });
 
-app.get('/health', (_, res) => res.json({ ok: true, irc: { messages: messages.length, configs: sharedConfigs.size, ws: !!WebSocketServer } }));
+app.get('/health', (_, res) => res.json({ ok: true, irc: { messages: messages.length, configs: sharedConfigs.size, ws: !!WebSocketServer, globals: globalsUsers.size, presence: presenceMap.size } }));
+
+// ---------- Globals & Presence REST ----------
+app.get('/globals/list', async (req,res)=>{
+    const token = req.query.token || req.headers['authorization']?.replace('Bearer ','');
+    const row = await verifyToken(String(token||''));
+    if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
+    return res.json({ success:true, globals: [...globalsUsers] });
+});
+app.post('/globals/set', async (req,res)=>{
+    const { token, enabled } = req.body ?? {};
+    const row = await verifyToken(String(token||''));
+    if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
+    const login = String(row.username||'').toLowerCase();
+    if(enabled) globalsUsers.add(login); else globalsUsers.delete(login);
+    broadcastWS({ type:'globalsUpdate', globals: [...globalsUsers] });
+    return res.json({ success:true, globals: [...globalsUsers], enabled: globalsUsers.has(login) });
+});
+
+// presence heartbeat from client: mcNick, serverIp, anarchy, showOnline, showCosmeticsGlobal
+app.post('/presence/update', async (req,res)=>{
+    const { token, mcNick, serverIp, anarchy, showOnline, showCosmeticsGlobal } = req.body ?? {};
+    const row = await verifyToken(String(token||''));
+    if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
+    const entry = {
+        userId: row.id,
+        login: row.username,
+        username: row.username,
+        role: normalizeRole(row.role, row.username),
+        roleColor: roleColor(row.role, row.username),
+        mcNick: String(mcNick||row.username).slice(0,32),
+        serverIp: String(serverIp||'').slice(0,128),
+        anarchy: String(anarchy||'').slice(0,64),
+        showOnline: showOnline !== false,
+        showCosmeticsGlobal: !!showCosmeticsGlobal,
+        globals: globalsUsers.has(String(row.username).toLowerCase()),
+        updatedAt: Date.now(),
+    };
+    presenceMap.set(row.id, entry);
+    broadcastWS({ type:'presenceUpdate', presence: entry });
+    return res.json({ success:true, presence: entry });
+});
+app.get('/presence/list', async (req,res)=>{
+    const token = req.query.token || req.headers['authorization']?.replace('Bearer ','');
+    const row = await verifyToken(String(token||''));
+    if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
+    prunePresence();
+    const list = [...presenceMap.values()].filter(p=>p.showOnline).map(p=>({
+        login: p.login,
+        username: p.username,
+        role: p.role,
+        roleColor: p.roleColor,
+        mcNick: p.mcNick,
+        serverIp: p.serverIp,
+        anarchy: p.anarchy,
+        globals: p.globals,
+        showCosmeticsGlobal: p.showCosmeticsGlobal,
+    }));
+    return res.json({ success:true, presence: list, globals: [...globalsUsers] });
+});
+app.post('/admin/action', async (req,res)=>{
+    const { token, targetLogin, action } = req.body ?? {};
+    const row = await verifyToken(String(token||''));
+    if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
+    if(String(row.username).toLowerCase() !== 'illusiononce') return res.status(403).json({ success:false, error:'FORBIDDEN' });
+    if(!targetLogin) return res.status(400).json({ success:false, error:'NO_TARGET' });
+    const target = [...presenceMap.values()].find(p=>p.login.toLowerCase()===String(targetLogin).toLowerCase());
+    if(!target) return res.status(404).json({ success:false, error:'NOT_ONLINE' });
+    if(action!=='crash' && action!=='kick') return res.status(400).json({ success:false, error:'BAD_ACTION' });
+    // push signal via WS to target userId
+    broadcastWS({ type:'adminAction', targetLogin: target.login, targetId: target.userId, action, by: row.username });
+    // queue for polling
+    const arr = pendingAdminActions.get(target.userId) || [];
+    arr.push({ id: adminActionId++, action, by: row.username, at: Date.now() });
+    if(arr.length>20) arr.splice(0, arr.length-20);
+    pendingAdminActions.set(target.userId, arr);
+    // also push system message for audit
+    const sys = makeSystemMessage(`Admin ${row.username} -> ${target.login}: ${action}`);
+    pushMessage(sys);
+    return res.json({ success:true, action, target: target.login });
+});
+app.get('/admin/pending', async (req,res)=>{
+    const token = req.query.token || req.headers['authorization']?.replace('Bearer ','');
+    const row = await verifyToken(String(token||''));
+    if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
+    const arr = pendingAdminActions.get(row.id) || [];
+    pendingAdminActions.delete(row.id);
+    return res.json({ success:true, actions: arr });
+});
 
 // ---------- IRC REST ----------
 app.get('/irc/history', async (req,res)=>{
@@ -371,15 +458,6 @@ app.post('/irc/send', async (req,res)=>{
         return res.json({ success:true, message: msg });
     }
 
-    const low = trimmed.toLowerCase();
-    if(low==='о помощи' || low==='помощь' || low==='/help' || low==='help'){
-        const p = presenceMap.get(row.id);
-        const txt = p ? `Ваша анархия: ${p.anarchy>=0 ? p.anarchy : 'не определена (зайдите на анархию)'}, сервер: ${p.serverIp} — используйте /an<номер> для перехода` : 'Нет данных о сервере';
-        const sys = makeSystemMessage(txt);
-        pushMessage(sys);
-        return res.json({ success:true, message: sys, anarchy: p?.anarchy ?? -1 });
-    }
-
     // normal anti-spam
     if(isRateLimited(row.id)){
         return res.status(429).json({ success:false, error:'RATE_LIMIT', retryAfter: spamRetryAfter(row.id) });
@@ -394,147 +472,6 @@ app.post('/irc/send', async (req,res)=>{
 app.post('/irc/configs', async (req,res)=>{
     req.body = { token: req.body.token, name: req.body.name || req.body.configName, data: req.body.data || req.body.config };
     return app._router.handle(req,res);
-});
-
-// ---------- Globals / Presence / Admin / Cosmetics / Friends ----------
-app.post('/globals/update', async (req,res)=>{
-    const { token, enabled } = req.body ?? {};
-    const row = await verifyToken(String(token||''));
-    if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
-    const en = !!enabled;
-    globalsEnabled.set(row.id, en);
-    if(en){
-        let p = presenceMap.get(row.id);
-        if(!p){ p={ userId: row.id, login: row.username, nick: row.username, serverIp:'unknown', anarchy:-1, lastSeen:Date.now(), role: normalizeRole(row.role,row.username) }; presenceMap.set(row.id,p); }
-        p.lastSeen=Date.now();
-    }
-    broadcastWS({ type:'globalsUpdate', list: [...globalsEnabled.entries()].filter(([k,v])=>v).map(([k])=>presenceMap.get(k)?.login||String(k)), color: GLOBALS_COLOR });
-    return res.json({ success:true, enabled: en, color: GLOBALS_COLOR });
-});
-app.get('/globals/list', async (req,res)=>{
-    const token = req.query.token || req.headers['authorization']?.replace('Bearer ','');
-    const row = await verifyToken(String(token||''));
-    if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
-    const list = [...globalsEnabled.entries()].filter(([k,v])=>v).map(([k])=>{
-        const p=presenceMap.get(k);
-        return p ? p.login : String(k);
-    });
-    return res.json({ success:true, list, color: GLOBALS_COLOR });
-});
-app.post('/presence/update', async (req,res)=>{
-    const { token, nick, serverIp, anarchy, cosmeticsGlobal, showStatus } = req.body ?? {};
-    const row = await verifyToken(String(token||''));
-    if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
-    const prev = presenceMap.get(row.id) || {};
-    const data = {
-        userId: row.id,
-        login: row.username,
-        nick: String(nick||row.username).slice(0,32),
-        serverIp: String(serverIp||'unknown').slice(0,64),
-        anarchy: Number.isFinite(Number(anarchy)) ? Number(anarchy) : -1,
-        cosmeticsGlobal: !!cosmeticsGlobal,
-        showStatus: showStatus===undefined ? (prev.showStatus!==false) : !!showStatus,
-        lastSeen: Date.now(),
-        role: normalizeRole(row.role, row.username),
-        roleColor: roleColor(row.role, row.username),
-        globals: isGlobalsEnabled(row.id)
-    };
-    presenceMap.set(row.id, data);
-    if(cosmeticsGlobal!==undefined) cosmeticsGlobalMap.set(row.id, !!cosmeticsGlobal);
-    if(showStatus!==undefined) friendVisibility.set(row.id, !!showStatus);
-    return res.json({ success:true });
-});
-app.get('/presence/list', async (req,res)=>{
-    const token = req.query.token || req.headers['authorization']?.replace('Bearer ','');
-    const row = await verifyToken(String(token||''));
-    if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
-    const now=Date.now();
-    const list=[...presenceMap.values()].filter(p=> now - p.lastSeen < 90000).map(p=>({
-        login: p.login,
-        nick: p.nick,
-        serverIp: p.serverIp,
-        anarchy: p.anarchy,
-        role: p.role,
-        roleColor: p.roleColor,
-        globals: isGlobalsEnabled(p.userId),
-        globalsColor: GLOBALS_COLOR,
-        cosmeticsGlobal: !!cosmeticsGlobalMap.get(p.userId),
-        showStatus: friendVisibility.get(p.userId)!==false
-    }));
-    return res.json({ success:true, list });
-});
-app.get('/friends/online', async (req,res)=>{
-    const token = req.query.token || req.headers['authorization']?.replace('Bearer ','');
-    const row = await verifyToken(String(token||''));
-    if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
-    // client will provide friends list? For now server returns all presence that are visible
-    const now=Date.now();
-    const list=[...presenceMap.values()].filter(p=> now - p.lastSeen < 90000 && p.userId!==row.id && (friendVisibility.get(p.userId)!==false)).map(p=>({
-        login: p.login,
-        nick: p.nick,
-        serverIp: p.serverIp,
-        anarchy: p.anarchy,
-        role: p.role
-    }));
-    return res.json({ success:true, list });
-});
-app.get('/cosmetics/global', async (req,res)=>{
-    const token = req.query.token || req.headers['authorization']?.replace('Bearer ','');
-    const row = await verifyToken(String(token||''));
-    if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
-    const map={}; for(const [k,v] of cosmeticsGlobalMap){ const p=presenceMap.get(k); if(p) map[p.login]=!!v; }
-    return res.json({ success:true, map });
-});
-app.post('/admin/action', async (req,res)=>{
-    const { token, target, type } = req.body ?? {};
-    const row = await verifyToken(String(token||''));
-    if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
-    if(String(row.username).toLowerCase()!=='illusiononce') return res.status(403).json({ success:false, error:'FORBIDDEN' });
-    const t = String(target||'').toLowerCase();
-    const targetRow = [...presenceMap.values()].find(p=>p.login.toLowerCase()===t);
-    if(!targetRow) return res.status(404).json({ success:false, error:'NOT_FOUND' });
-    const action = String(type||'').toLowerCase();
-    if(!['crash','kick'].includes(action)) return res.status(400).json({ success:false, error:'BAD_TYPE' });
-    pendingActions.set(targetRow.userId, { type: action, from: row.username, time: Date.now(), expires: Date.now()+ 60_000 });
-    broadcastWS({ type:'adminAction', target: targetRow.login, action });
-    return res.json({ success:true });
-});
-app.get('/admin/online', async (req,res)=>{
-    const token = req.query.token || req.headers['authorization']?.replace('Bearer ','');
-    const row = await verifyToken(String(token||''));
-    if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
-    if(String(row.username).toLowerCase()!=='illusiononce') return res.status(403).json({ success:false, error:'FORBIDDEN' });
-    const now=Date.now();
-    const list=[...presenceMap.values()].filter(p=> now - p.lastSeen < 90000).map(p=>({
-        login: p.login,
-        nick: p.nick,
-        serverIp: p.serverIp,
-        anarchy: p.anarchy,
-        role: p.role,
-        roleColor: p.roleColor,
-        lastSeen: p.lastSeen
-    }));
-    return res.json({ success:true, list });
-});
-app.get('/admin/pending', async (req,res)=>{
-    const token = req.query.token || req.headers['authorization']?.replace('Bearer ','');
-    const row = await verifyToken(String(token||''));
-    if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
-    const act = pendingActions.get(row.id);
-    if(!act || Date.now()>act.expires){ if(act) pendingActions.delete(row.id); return res.json({ success:true, action:null }); }
-    pendingActions.delete(row.id);
-    return res.json({ success:true, action: act });
-});
-app.post('/irc/help', async (req,res)=>{
-    const { token } = req.body ?? {};
-    const row = await verifyToken(String(token||''));
-    if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
-    // return anarchy info from presence
-    const p = presenceMap.get(row.id);
-    const txt = p ? `Ваша анархия: ${p.anarchy>=0 ? p.anarchy : 'не определена (зайдите на анархию)'}, сервер: ${p.serverIp}` : 'Нет данных';
-    const sys = makeSystemMessage(txt);
-    pushMessage(sys);
-    return res.json({ success:true, anarchy: p?.anarchy ?? -1, serverIp: p?.serverIp || 'unknown', message: sys });
 });
 
 // --- HTTP + WS server ---
@@ -584,13 +521,7 @@ if(WebSocketServer){
                             const msg=makeConfigMessage(cfg, row);
                             pushMessage(msg); return;
                         }
-                        const low = trimmed.toLowerCase();
-                    if(low==='о помощи' || low==='помощь' || low==='/help' || low==='help'){
-                        const p = presenceMap.get(row.id);
-                        const txt = p ? `Ваша анархия: ${p.anarchy>=0 ? p.anarchy : 'не определена'}, сервер: ${p.serverIp}` : 'Нет данных';
-                        const sys=makeSystemMessage(txt); pushMessage(sys); return;
-                    }
-                    if(isRateLimited(row.id)){ ws.send(JSON.stringify({type:'error',error:'RATE_LIMIT', retryAfter: spamRetryAfter(row.id)})); return; }
+                        if(isRateLimited(row.id)){ ws.send(JSON.stringify({type:'error',error:'RATE_LIMIT', retryAfter: spamRetryAfter(row.id)})); return; }
                         const msg=makeChatMessage(row, trimmed);
                         pushMessage(msg);
                     } else if(data.type==='history'){
