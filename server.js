@@ -474,6 +474,130 @@ app.post('/irc/configs', async (req,res)=>{
     return app._router.handle(req,res);
 });
 
+// ---------- Lua Scripts Market (integration.sql) ----------
+// Таблицы: scripts, script_purchases, script_states.
+// Клиент опрашивает GET /api/client/scripts и качает файлы —
+// модули с сайта появляются в игре БЕЗ перезахода.
+
+function marketUnavailable(res, e){
+    // Миграция integration.sql ещё не применена — не роняем опрос клиента.
+    if(e && (e.code==='42P01' || /does not exist/i.test(String(e.message||'')))){
+        return res.json({ success:true, market_available:false, active:false, scripts:[] });
+    }
+    throw e;
+}
+
+function parseSince(value){
+    if(value===undefined || value===null || value==='') return null;
+    if(/^\d+$/.test(String(value))) return new Date(Number(value));
+    const d = new Date(String(value));
+    return isNaN(d.getTime()) ? null : d;
+}
+
+app.get('/api/client/scripts', async (req, res) => {
+    try{
+        const row = await verifyToken(String(req.query.token||''));
+        if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
+        const since = parseSince(req.query.since);
+        const client = await pool.connect();
+        try{
+            const params = [row.id];
+            let sinceFilter = '';
+            if(since){
+                params.push(since.toISOString());
+                sinceFilter = `AND COALESCE(st.updated_at, p.purchased_at, s.created_at) > $2`;
+            }
+            const { rows } = await client.query(
+                `SELECT s.id, s.title, s.description, s.preview_image, s.file_name,
+                        s.file_size, s.file_ext, s.price, s.is_free, s.created_at,
+                        COALESCE(st.enabled, TRUE) AS enabled,
+                        COALESCE(st.updated_at, p.purchased_at, s.created_at) AS updated_at
+                   FROM scripts s
+                   LEFT JOIN script_purchases p ON p.script_id = s.id AND p.user_id = $1
+                   LEFT JOIN script_states st ON st.script_id = s.id AND st.user_id = $1
+                  WHERE s.status = 'approved'
+                    AND (s.is_free = TRUE OR p.user_id IS NOT NULL)
+                    ${sinceFilter}
+                  ORDER BY s.id ASC`,
+                params
+            );
+            return res.json({
+                success: true,
+                market_available: true,
+                active: isSubActive(row),
+                user: mapUser(row),
+                scripts: rows.map(r=>({
+                    id: r.id,
+                    title: r.title,
+                    description: r.description,
+                    preview_image: r.preview_image,
+                    file_name: r.file_name,
+                    file_ext: r.file_ext,
+                    file_size: r.file_size,
+                    price: r.price,
+                    is_free: r.is_free,
+                    enabled: r.enabled,
+                    updated_at: r.updated_at ? new Date(r.updated_at).toISOString() : null,
+                })),
+            });
+        } finally { client.release(); }
+    }catch(e){ try{ return marketUnavailable(res, e); }catch(_){ return res.status(500).json({ success:false, error:'DB_ERROR' }); } }
+});
+
+app.get('/api/client/scripts/:id/file', async (req, res) => {
+    try{
+        const row = await verifyToken(String(req.query.token||''));
+        if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
+        const id = parseInt(req.params.id, 10);
+        if(!id) return res.status(400).json({ success:false, error:'BAD_ID' });
+        const client = await pool.connect();
+        try{
+            const { rows } = await client.query(
+                `SELECT s.file_name, s.file_data
+                   FROM scripts s
+                   LEFT JOIN script_purchases p ON p.script_id = s.id AND p.user_id = $1
+                  WHERE s.id = $2 AND s.status = 'approved'
+                    AND (s.is_free = TRUE OR p.user_id IS NOT NULL)
+                  LIMIT 1`,
+                [row.id, id]
+            );
+            if(rows.length===0) return res.status(404).json({ success:false, error:'NOT_FOUND' });
+            return res.json({ success:true, id, file_name: rows[0].file_name, file_data: rows[0].file_data });
+        } finally { client.release(); }
+    }catch(e){ try{ return marketUnavailable(res, e); }catch(_){ return res.status(500).json({ success:false, error:'DB_ERROR' }); } }
+});
+
+app.post('/api/scripts/:id/toggle', async (req, res) => {
+    try{
+        const { token, enabled } = req.body ?? {};
+        const row = await verifyToken(String(token||''));
+        if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
+        const id = parseInt(req.params.id, 10);
+        if(!id) return res.status(400).json({ success:false, error:'BAD_ID' });
+        const client = await pool.connect();
+        try{
+            const owned = await client.query(
+                `SELECT s.id FROM scripts s
+                   LEFT JOIN script_purchases p ON p.script_id = s.id AND p.user_id = $1
+                  WHERE s.id = $2 AND s.status = 'approved'
+                    AND (s.is_free = TRUE OR p.user_id IS NOT NULL)
+                  LIMIT 1`,
+                [row.id, id]
+            );
+            if(owned.rows.length===0) return res.status(404).json({ success:false, error:'NOT_FOUND' });
+            await client.query(
+                `INSERT INTO script_states (user_id, script_id, enabled, updated_at)
+                 VALUES ($1, $2, $3, NOW())
+                 ON CONFLICT (user_id, script_id)
+                 DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = NOW()`,
+                [row.id, id, !!enabled]
+            );
+            broadcastWS({ type:'scriptsUpdate', userId: row.id });
+            return res.json({ success:true, id, enabled: !!enabled });
+        } finally { client.release(); }
+    }catch(e){ return res.status(500).json({ success:false, error:'DB_ERROR' }); }
+});
+
 // --- HTTP + WS server ---
 const server = http.createServer(app);
 let wss = null;
