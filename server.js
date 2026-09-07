@@ -181,9 +181,16 @@ async function verifyToken(token){
         const row = rows[0];
         if(!row.session_expires_at || new Date(row.session_expires_at) < new Date()) return null;
         if(isBanned(row)) return null;
-        if(!isSubActive(row)) return null;
         return row;
     } finally { client.release(); }
+}
+
+// Strict verify for alpha-only features (launch, etc.)
+async function verifyTokenAlpha(token){
+    const row = await verifyToken(token);
+    if(!row) return null;
+    if(!isSubActive(row)) return null;
+    return row;
 }
 
 // periodic cleanup of rateMap
@@ -215,13 +222,11 @@ app.post('/login', async (req, res) => {
         }
 
         if (isBanned(row)) {
-            return res.json({ success: false, error: 'BANNED' });
+            return res.json({ success: false, error: 'BANNED', bannedUntil: row.banned_until, banReason: row.ban_reason });
         }
 
-        if (!isSubActive(row)) {
-            return res.json({ success: false, error: 'NO_SUBSCRIPTION' });
-        }
-
+        // Allow login for all users. Launcher will check subscriptionActive for Alpha launch.
+        // Keep compatibility: include NO_SUBSCRIPTION as soft flag, not hard error, but also send canLaunchAlpha.
         const token     = generateToken();
         const expiresAt = new Date(Date.now() + 30 * 24 * 3600 * 1000);
 
@@ -230,7 +235,8 @@ app.post('/login', async (req, res) => {
             [token, expiresAt, row.id]
         );
 
-        return res.json({ success: true, token, user: mapUser(row) });
+        const user = mapUser(row);
+        return res.json({ success: true, token, user, canLaunchAlpha: user.subscriptionActive });
 
     } catch (err) {
         console.error('[/login]', err);
@@ -264,10 +270,10 @@ app.post('/session', async (req, res) => {
             return res.json({ success: false, error: 'SESSION_EXPIRED' });
         }
 
-        if (isBanned(row))     return res.json({ success: false, error: 'BANNED' });
-        if (!isSubActive(row)) return res.json({ success: false, error: 'NO_SUBSCRIPTION' });
-
-        return res.json({ success: true, token, user: mapUser(row) });
+        if (isBanned(row))     return res.json({ success: false, error: 'BANNED', bannedUntil: row.banned_until, banReason: row.ban_reason });
+        // Do not block on subscription here - return success with flag
+        const user = mapUser(row);
+        return res.json({ success: true, token, user, canLaunchAlpha: user.subscriptionActive });
 
     } catch (err) {
         console.error('[/session]', err);
