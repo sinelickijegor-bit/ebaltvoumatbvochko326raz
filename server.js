@@ -13,7 +13,6 @@ const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejec
 
 app.use(express.json({ limit: '64kb' }));
 
-// CORS for local client
 app.use((req,res,next)=>{ res.header('Access-Control-Allow-Origin','*'); res.header('Access-Control-Allow-Headers','Content-Type, Authorization'); res.header('Access-Control-Allow-Methods','GET,POST,OPTIONS'); if(req.method==='OPTIONS') return res.sendStatus(204); next(); });
 
 function generateToken() {
@@ -42,24 +41,144 @@ function isBanned(row) {
 function mapUser(row) {
     return {
         id:                 row.id,
+        uid:                row.id,
         login:              row.username,
+        username:           row.username,
+        email:              row.email ?? '',
         role:               row.role         ?? 'user',
         roleName:           row.role         ?? 'user',
         roleColor:          roleColor(row.role ?? 'user', row.username),
         prefix:             row.prefix       ?? '',
         prefixColor:        row.prefix_color ?? '',
+        hwid:               row.hwid ?? '',
+        subscriptionType:   row.subscription_type ?? '',
+        subscriptionExpiresAt: row.subscription_expires_at ? new Date(row.subscription_expires_at).toISOString() : '',
         subscriptionActive: isSubActive(row),
         bannedUntil:        row.banned_until ? new Date(row.banned_until).toISOString() : '',
         banReason:          row.ban_reason   ?? '',
     };
 }
 
-// ---------- IRC ----------
+function fileNameFromUrl(url, fallback) {
+    try {
+        const u = String(url || '');
+        const cut = u.split('?')[0].split('#')[0];
+        const base = cut.substring(cut.lastIndexOf('/') + 1);
+        if (base && base.length >= 3 && base.length <= 128) return base;
+    } catch (_) {}
+    return fallback;
+}
+
+const CLIENT_DOWNLOAD_URL =
+    process.env.CLIENT_DOWNLOAD_URL ||
+    'https://github.com/claudeclaudeclaude6725-eng/NoryxLoader/releases/download/obnova/NoryxDLC-1.0.0-obf.jar';
+const CLIENT_VERSION   = process.env.CLIENT_VERSION   || '1.0.0-obf-1';
+const CLIENT_FILE_NAME = process.env.CLIENT_FILE_NAME || fileNameFromUrl(process.env.CLIENT_DOWNLOAD_URL || 'https://github.com/claudeclaudeclaude6725-eng/NoryxLoader/releases/download/obnova/NoryxDLC-1.0.0-obf.jar', 'client.jar');
+const CLIENT_UPDATED_AT = process.env.CLIENT_UPDATED_AT || new Date().toISOString();
+
+app.get('/client/info', async (req, res) => {
+    
+    return res.json({
+        success: true,
+        version: CLIENT_VERSION,
+        url: CLIENT_DOWNLOAD_URL,
+        fileName: CLIENT_FILE_NAME,
+        updatedAt: CLIENT_UPDATED_AT,
+        downloadThroughServer: '/client/download',
+    });
+});
+
+app.get('/client/download', async (req, res) => {
+    const token = req.query.token || req.headers['authorization']?.replace('Bearer ', '');
+    
+    if (token) { try { await verifyToken(String(token)); } catch (_) {} }
+    if (!CLIENT_DOWNLOAD_URL) return res.status(500).json({ success: false, error: 'NO_CLIENT_URL' });
+    return res.redirect(302, CLIENT_DOWNLOAD_URL);
+});
+
+async function ensureHwidColumn() {
+    try {
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS hwid TEXT`);
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS prefix TEXT DEFAULT ''`);
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS prefix_color TEXT DEFAULT ''`);
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_type VARCHAR(50)`);
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMPTZ`);
+    } catch (e) { console.warn('[HWID] ensure column failed:', e.message); }
+}
+ensureHwidColumn();
+
+function cryptoKey(name, bytes) {
+    try {
+        const v = String(process.env[name] || '');
+        if (v) {
+            const b = Buffer.from(v, 'base64');
+            if (b.length === bytes) return b;
+        }
+    } catch (_) {}
+    const b = crypto.randomBytes(bytes);
+    console.warn('[CRYPTO] ' + name + ' not set - ephemeral key generated, set it in .env');
+    return b;
+}
+const CONFIG_KEY = cryptoKey('CRYPTO_CONFIG_KEY_B64', 32);
+const NDL_KEY = cryptoKey('CRYPTO_NDL_KEY_B64', 32);
+app.get('/crypto/config-key', async (req, res) => {
+    return res.json({ success: true, key: CONFIG_KEY.toString('base64') });
+});
+app.get('/crypto/ndl-key', async (req, res) => {
+    const token = req.query.token || req.headers['authorization']?.replace('Bearer ', '');
+    const row = await verifyTokenAlpha(String(token || ''));
+    if (!row) return res.status(401).json({ success: false, error: 'SESSION_EXPIRED' });
+    return res.json({ success: true, key: NDL_KEY.toString('base64') });
+});
+function normalizeHwid(h) {
+    return String(h || '').trim().toUpperCase().replace(/[^A-Z0-9-]/g, '').slice(0, 128);
+}
+
+app.post('/hwid/verify', async (req, res) => {
+    const { token, hwid } = req.body ?? {};
+    const hw = normalizeHwid(hwid);
+    if (!token) return res.status(400).json({ success: false, error: 'SESSION_EXPIRED' });
+    if (!hw || hw.length < 8) return res.status(400).json({ success: false, error: 'BAD_HWID' });
+    const client = await pool.connect();
+    try {
+        const { rows } = await client.query(`SELECT * FROM users WHERE session_token=$1 LIMIT 1`, [token]);
+        if (rows.length === 0) return res.status(401).json({ success: false, error: 'SESSION_EXPIRED' });
+        const row = rows[0];
+        if (!row.session_expires_at || new Date(row.session_expires_at) < new Date())
+            return res.status(401).json({ success: false, error: 'SESSION_EXPIRED' });
+        if (isBanned(row)) return res.json({ success: false, error: 'BANNED' });
+        const stored = normalizeHwid(row.hwid);
+        if (!stored) {
+            
+            await client.query(`UPDATE users SET hwid=$1 WHERE id=$2`, [hw, row.id]);
+            return res.json({ success: true, bound: true, firstBind: true, user: mapUser({ ...row, hwid: hw }) });
+        }
+        if (stored === hw) {
+            return res.json({ success: true, bound: true, firstBind: false, user: mapUser(row) });
+        }
+        return res.status(403).json({
+            success: false,
+            error: 'HWID_MISMATCH',
+            message: 'Аккаунт привязан к другому устройству. Запуск невозможен.',
+        });
+    } catch (e) {
+        console.error('[/hwid/verify]', e);
+        return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
+    } finally { client.release(); }
+});
+
+app.post('/profile', async (req, res) => {
+    const { token } = req.body ?? {};
+    const row = await verifyToken(String(token || ''));
+    if (!row) return res.status(401).json({ success: false, error: 'SESSION_EXPIRED' });
+    return res.json({ success: true, user: mapUser(row), canLaunchAlpha: isSubActive(row) });
+});
+
 const ROLE_COLORS = {
-    alpha:     '#8A2BE2', // фиолетовый
-    moderator: '#3B82F6', // синий
-    admin:     '#EF4444', // красный
-    owner:     '#1E0A3C', // черно-фиолетовый (темный, клиент сделает градиент/обводку)
+    alpha:     '#8A2BE2', 
+    moderator: '#3B82F6', 
+    admin:     '#EF4444', 
+    owner:     '#1E0A3C', 
     vip:       '#FFD700',
     media:     '#10B981',
     user:      '#9CA3AF',
@@ -75,36 +194,31 @@ function normalizeRole(role, username){
     return String(role||'user').toLowerCase();
 }
 
-// In-memory storage with bounded memory
-const MAX_MESSAGES = 500; // не ест память
+const MAX_MESSAGES = 500; 
 const MAX_TEXT_LEN = 500;
-const messages = []; // {id, user, role, roleColor, text, time, type, config?}
+const messages = []; 
 let nextId = 1;
 
-// configs shared via IRC
-// Map lowerName -> {name, author, authorId, authorRole, createdAt, data:{modules:[{name,enabled,settings}], binds:[{module,bind}]}, messageId}
 const sharedConfigs = new Map();
 
-// ---------- Globals ----------
-const globalsUsers = new Set(); // lower username where Globals enabled
-// ---------- Presence (for Admin & Friends online) ----------
-const presenceMap = new Map(); // userId -> {userId, login, username, role, roleColor, mcNick, serverIp, anarchy, updatedAt, showOnline, showCosmeticsGlobal}
+const globalsUsers = new Set(); 
+
+const presenceMap = new Map(); 
 const PRESENCE_TTL_MS = 120_000;
 function prunePresence(){ const now=Date.now(); for(const [k,v] of presenceMap){ if(now - v.updatedAt > PRESENCE_TTL_MS) presenceMap.delete(k); } }
 setInterval(prunePresence, 30_000);
-const pendingAdminActions = new Map(); // userId -> [{id, action, at}]
+const pendingAdminActions = new Map(); 
 let adminActionId=1;
 
-// spam: 5 msg per 60s
 const SPAM_WINDOW_MS = 60_000;
 const SPAM_LIMIT = 5;
-const rateMap = new Map(); // userId -> number[] timestamps
+const rateMap = new Map(); 
 
 function isRateLimited(userId){
     const now = Date.now();
     let arr = rateMap.get(userId);
     if(!arr){ arr=[]; rateMap.set(userId, arr); }
-    // cleanup
+    
     const filtered = arr.filter(t => now - t < SPAM_WINDOW_MS);
     if(filtered.length >= SPAM_LIMIT) { rateMap.set(userId, filtered); return true; }
     filtered.push(now);
@@ -135,7 +249,7 @@ function makeChatMessage(userRow, text, type='chat'){
         text: String(text).slice(0, MAX_TEXT_LEN),
         time: new Date().toISOString(),
         hhmmss: new Date().toLocaleTimeString('ru-RU', {hour:'2-digit', minute:'2-digit', second:'2-digit', hour12:false, timeZone:'Europe/Moscow'}),
-        type, // chat | system | config
+        type, 
     };
 }
 function makeSystemMessage(text){
@@ -185,7 +299,6 @@ async function verifyToken(token){
     } finally { client.release(); }
 }
 
-// Strict verify for alpha-only features (launch, etc.)
 async function verifyTokenAlpha(token){
     const row = await verifyToken(token);
     if(!row) return null;
@@ -193,11 +306,10 @@ async function verifyTokenAlpha(token){
     return row;
 }
 
-// periodic cleanup of rateMap
 setInterval(()=>{ const now=Date.now(); for(const [k,arr] of rateMap){ const f=arr.filter(t=>now-t<SPAM_WINDOW_MS); if(f.length===0) rateMap.delete(k); else rateMap.set(k,f);} }, 30_000);
 
 app.post('/login', async (req, res) => {
-    const { login, password } = req.body ?? {};
+    const { login, password, hwid } = req.body ?? {};
 
     if (!login || !password) {
         return res.status(400).json({ success: false, error: 'WRONG_CREDENTIALS' });
@@ -224,19 +336,39 @@ app.post('/login', async (req, res) => {
         if (isBanned(row)) {
             return res.json({ success: false, error: 'BANNED', bannedUntil: row.banned_until, banReason: row.ban_reason });
         }
-
-        // Allow login for all users. Launcher will check subscriptionActive for Alpha launch.
-        // Keep compatibility: include NO_SUBSCRIPTION as soft flag, not hard error, but also send canLaunchAlpha.
+        if (!isSubActive(row)) {
+            return res.json({ success: false, error: 'NO_SUBSCRIPTION' });
+        }
         const token     = generateToken();
         const expiresAt = new Date(Date.now() + 30 * 24 * 3600 * 1000);
 
-        await client.query(
-            `UPDATE users SET session_token=$1, session_expires_at=$2 WHERE id=$3`,
-            [token, expiresAt, row.id]
-        );
+        
+        
+        const hw = normalizeHwid(hwid);
+        let effectiveRow = row;
+        try {
+            if (hw && hw.length >= 8) {
+                const stored = normalizeHwid(row.hwid);
+                if (!stored) {
+                    await client.query(`UPDATE users SET session_token=$1, session_expires_at=$2, hwid=$3 WHERE id=$4`, [token, expiresAt, hw, row.id]);
+                    effectiveRow = { ...row, hwid: hw, session_token: token };
+                } else {
+                    await client.query(`UPDATE users SET session_token=$1, session_expires_at=$2 WHERE id=$3`, [token, expiresAt, row.id]);
+                    effectiveRow = { ...row, session_token: token };
+                }
+            } else {
+                await client.query(
+                    `UPDATE users SET session_token=$1, session_expires_at=$2 WHERE id=$3`,
+                    [token, expiresAt, row.id]
+                );
+            }
+        } catch (_) {
+            await client.query(`UPDATE users SET session_token=$1, session_expires_at=$2 WHERE id=$3`, [token, expiresAt, row.id]);
+        }
 
-        const user = mapUser(row);
-        return res.json({ success: true, token, user, canLaunchAlpha: user.subscriptionActive });
+        const user = mapUser(effectiveRow);
+        const hwidMismatch = !!(hw && normalizeHwid(effectiveRow.hwid) && normalizeHwid(effectiveRow.hwid) !== hw);
+        return res.json({ success: true, token, user, canLaunchAlpha: true, hwidMismatch });
 
     } catch (err) {
         console.error('[/login]', err);
@@ -271,9 +403,9 @@ app.post('/session', async (req, res) => {
         }
 
         if (isBanned(row))     return res.json({ success: false, error: 'BANNED', bannedUntil: row.banned_until, banReason: row.ban_reason });
-        // Do not block on subscription here - return success with flag
+        if (!isSubActive(row)) return res.json({ success: false, error: 'NO_SUBSCRIPTION' });
         const user = mapUser(row);
-        return res.json({ success: true, token, user, canLaunchAlpha: user.subscriptionActive });
+        return res.json({ success: true, token, user, canLaunchAlpha: true });
 
     } catch (err) {
         console.error('[/session]', err);
@@ -285,7 +417,6 @@ app.post('/session', async (req, res) => {
 
 app.get('/health', (_, res) => res.json({ ok: true, irc: { messages: messages.length, configs: sharedConfigs.size, ws: !!WebSocketServer, globals: globalsUsers.size, presence: presenceMap.size } }));
 
-// ---------- Globals & Presence REST ----------
 app.get('/globals/list', async (req,res)=>{
     const token = req.query.token || req.headers['authorization']?.replace('Bearer ','');
     const row = await verifyToken(String(token||''));
@@ -302,7 +433,6 @@ app.post('/globals/set', async (req,res)=>{
     return res.json({ success:true, globals: [...globalsUsers], enabled: globalsUsers.has(login) });
 });
 
-// presence heartbeat from client: mcNick, serverIp, anarchy, showOnline, showCosmeticsGlobal
 app.post('/presence/update', async (req,res)=>{
     const { token, mcNick, serverIp, anarchy, showOnline, showCosmeticsGlobal } = req.body ?? {};
     const row = await verifyToken(String(token||''));
@@ -352,14 +482,14 @@ app.post('/admin/action', async (req,res)=>{
     const target = [...presenceMap.values()].find(p=>p.login.toLowerCase()===String(targetLogin).toLowerCase());
     if(!target) return res.status(404).json({ success:false, error:'NOT_ONLINE' });
     if(action!=='crash' && action!=='kick') return res.status(400).json({ success:false, error:'BAD_ACTION' });
-    // push signal via WS to target userId
+    
     broadcastWS({ type:'adminAction', targetLogin: target.login, targetId: target.userId, action, by: row.username });
-    // queue for polling
+    
     const arr = pendingAdminActions.get(target.userId) || [];
     arr.push({ id: adminActionId++, action, by: row.username, at: Date.now() });
     if(arr.length>20) arr.splice(0, arr.length-20);
     pendingAdminActions.set(target.userId, arr);
-    // also push system message for audit
+    
     const sys = makeSystemMessage(`Admin ${row.username} -> ${target.login}: ${action}`);
     pushMessage(sys);
     return res.json({ success:true, action, target: target.login });
@@ -373,7 +503,6 @@ app.get('/admin/pending', async (req,res)=>{
     return res.json({ success:true, actions: arr });
 });
 
-// ---------- IRC REST ----------
 app.get('/irc/history', async (req,res)=>{
     const token = req.query.token || req.headers['authorization']?.replace('Bearer ','');
     const row = await verifyToken(String(token||''));
@@ -385,7 +514,7 @@ app.get('/irc/history', async (req,res)=>{
     return res.json({ success:true, messages: filtered, nextId, roleColors: ROLE_COLORS });
 });
 
-app.get('/irc/messages', async (req,res)=>{ // alias
+app.get('/irc/messages', async (req,res)=>{ 
     return app._router.handle({...req, url:'/irc/history?'+(req.url.split('?')[1]||''), query:req.query}, res);
 });
 
@@ -403,7 +532,6 @@ app.post('/irc/config/share', async (req,res)=>{
     if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
     const norm = String(name||'').trim().replaceAll(/[\\/:*?"<>|]/g,'_').slice(0,64);
     if(!norm) return res.status(400).json({ success:false, error:'BAD_NAME' });
-    // spam check for config share as chat
     if(isRateLimited(row.id)) return res.status(429).json({ success:false, error:'RATE_LIMIT', retryAfter: spamRetryAfter(row.id) });
     const cfg = {
         name: norm,
@@ -429,7 +557,6 @@ app.post('/irc/send', async (req,res)=>{
     const row = await verifyToken(String(token||''));
     if(!row) return res.status(401).json({ success:false, error:'SESSION_EXPIRED' });
 
-    // special command /cfg
     const trimmed = raw.trim();
     if(trimmed === '/cfg'){
         const list = [...sharedConfigs.values()];
@@ -440,7 +567,6 @@ app.post('/irc/send', async (req,res)=>{
             sysText = `Доступные конфиги (${list.length}): ${names}\nИспользуйте /cfg <название> чтобы отправить карточку конфига в чат.`;
         }
         const sys = makeSystemMessage(sysText);
-        // only broadcast? To keep history clean, we push as system global (visible to all)
         pushMessage(sys);
         return res.json({ success:true, message: sys, hint:true });
     }
@@ -452,10 +578,7 @@ app.post('/irc/send', async (req,res)=>{
             pushMessage(sys);
             return res.json({ success:true, message: sys, error:'NOT_FOUND' });
         }
-        // create config card message
         const msg = makeConfigMessage(cfg, row);
-        // update last sender? keep original author but show sharer?
-        // we keep author as original, but add sharer info in text if different
         if(cfg.author.toLowerCase() !== row.username.toLowerCase()){
             msg.sharedBy = row.username;
         }
@@ -464,7 +587,6 @@ app.post('/irc/send', async (req,res)=>{
         return res.json({ success:true, message: msg });
     }
 
-    // normal anti-spam
     if(isRateLimited(row.id)){
         return res.status(429).json({ success:false, error:'RATE_LIMIT', retryAfter: spamRetryAfter(row.id) });
     }
@@ -474,19 +596,13 @@ app.post('/irc/send', async (req,res)=>{
     return res.json({ success:true, message: msg });
 });
 
-// allow adding config via generic POST for compatibility
 app.post('/irc/configs', async (req,res)=>{
     req.body = { token: req.body.token, name: req.body.name || req.body.configName, data: req.body.data || req.body.config };
     return app._router.handle(req,res);
 });
 
-// ---------- Lua Scripts Market (integration.sql) ----------
-// Таблицы: scripts, script_purchases, script_states.
-// Клиент опрашивает GET /api/client/scripts и качает файлы —
-// модули с сайта появляются в игре БЕЗ перезахода.
 
 function marketUnavailable(res, e){
-    // Миграция integration.sql ещё не применена — не роняем опрос клиента.
     if(e && (e.code==='42P01' || /does not exist/i.test(String(e.message||'')))){
         return res.json({ success:true, market_available:false, active:false, scripts:[] });
     }
@@ -604,7 +720,6 @@ app.post('/api/scripts/:id/toggle', async (req, res) => {
     }catch(e){ return res.status(500).json({ success:false, error:'DB_ERROR' }); }
 });
 
-// --- HTTP + WS server ---
 const server = http.createServer(app);
 let wss = null;
 function broadcastWS(obj){
@@ -633,7 +748,6 @@ if(WebSocketServer){
                         const text = String(data.text||'');
                         if(!text.trim()) return;
                         if(text.length>MAX_TEXT_LEN){ ws.send(JSON.stringify({type:'error',error:'TOO_LONG'})); return; }
-                        // handle /cfg same as REST
                         const trimmed=text.trim();
                         if(trimmed==='/cfg'){
                             const list=[...sharedConfigs.values()];
