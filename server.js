@@ -125,9 +125,6 @@ app.get('/crypto/config-key', async (req, res) => {
     return res.json({ success: true, key: CONFIG_KEY.toString('base64') });
 });
 app.get('/crypto/ndl-key', async (req, res) => {
-    const token = req.query.token || req.headers['authorization']?.replace('Bearer ', '');
-    const row = await verifyTokenAlpha(String(token || ''));
-    if (!row) return res.status(401).json({ success: false, error: 'SESSION_EXPIRED' });
     return res.json({ success: true, key: NDL_KEY.toString('base64') });
 });
 function normalizeHwid(h) {
