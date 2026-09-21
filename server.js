@@ -19,8 +19,25 @@ function generateToken() {
     return crypto.randomBytes(64).toString('hex');
 }
 
+let bcrypt = null;
+try { bcrypt = require('bcrypt'); } catch(e) { console.warn('[AUTH] bcrypt not installed - only plaintext passwords will match'); }
+
 function verifyPw(password, stored) {
-    return Promise.resolve(String(stored || '') === String(password || ''));
+    const pw = String(password || '');
+    const st = String(stored || '');
+    if (!pw || !st) return Promise.resolve(false);
+    // bcrypt hash ($2a$/$2b$/$2y$) -> real compare; otherwise legacy plaintext compare
+    if (/^\$2[aby]\$/.test(st) && bcrypt) {
+        return bcrypt.compare(pw, st).catch(() => false);
+    }
+    try {
+        const a = Buffer.from(pw, 'utf8');
+        const b = Buffer.from(st, 'utf8');
+        if (a.length !== b.length) return Promise.resolve(false);
+        return Promise.resolve(crypto.timingSafeEqual(a, b));
+    } catch (_) {
+        return Promise.resolve(pw === st);
+    }
 }
 
 const ALLOWED_ROLES = new Set(['admin', 'moderator', 'vip', 'alpha', 'media', 'owner']);
@@ -115,8 +132,26 @@ function cryptoKey(name, bytes) {
             if (b.length === bytes) return b;
         }
     } catch (_) {}
+    // Ключа нет/битый: генерируем ОДИН РАЗ и сохраняем в server/.env,
+    // иначе каждый рестарт сервера давал новый эфемерный ключ и ВСЕ
+    // собранные jar'ники падали в bootstrap (расшифровка строк/классов),
+    // т.к. обфускация шифрует build-time ключом, а лоадер тянет runtime-ключ.
     const b = crypto.randomBytes(bytes);
-    console.warn('[CRYPTO] ' + name + ' not set - ephemeral key generated, set it in .env');
+    try {
+        const fs = require('fs');
+        const path = require('path');
+        const envPath = path.join(__dirname, '.env');
+        let cur = '';
+        try { cur = fs.readFileSync(envPath, 'utf8'); } catch (_) {}
+        if (cur.includes(name + '=')) {
+            console.warn('[CRYPTO] ' + name + ' invalid in .env - ephemeral key generated! Loader WILL break after restart. Fix .env!');
+        } else {
+            fs.appendFileSync(envPath, (cur === '' || cur.endsWith('\n') ? '' : '\n') + name + '=' + b.toString('base64') + '\n');
+            console.log('[CRYPTO] ' + name + ' generated and saved to .env - DO NOT change it, rebuild loader after any key change');
+        }
+    } catch (e) {
+        console.warn('[CRYPTO] ' + name + ' not set - ephemeral key generated, set it in .env');
+    }
     return b;
 }
 const CONFIG_KEY = cryptoKey('CRYPTO_CONFIG_KEY_B64', 32);
@@ -342,11 +377,20 @@ app.post('/login', async (req, res) => {
         
         
         const hw = normalizeHwid(hwid);
+        // Чужой HWID -> отказ ДО выдачи токена (иначе в БД останется валидная сессия).
+        // Первый вход (stored пуст) -> привязка ниже.
+        const storedHw = normalizeHwid(row.hwid);
+        if (hw && hw.length >= 8 && storedHw && storedHw !== hw) {
+            return res.status(403).json({
+                success: false,
+                error: 'HWID_MISMATCH',
+                message: 'Аккаунт привязан к другому устройству. Запуск невозможен.',
+            });
+        }
         let effectiveRow = row;
         try {
             if (hw && hw.length >= 8) {
-                const stored = normalizeHwid(row.hwid);
-                if (!stored) {
+                if (!storedHw) {
                     await client.query(`UPDATE users SET session_token=$1, session_expires_at=$2, hwid=$3 WHERE id=$4`, [token, expiresAt, hw, row.id]);
                     effectiveRow = { ...row, hwid: hw, session_token: token };
                 } else {
@@ -364,8 +408,7 @@ app.post('/login', async (req, res) => {
         }
 
         const user = mapUser(effectiveRow);
-        const hwidMismatch = !!(hw && normalizeHwid(effectiveRow.hwid) && normalizeHwid(effectiveRow.hwid) !== hw);
-        return res.json({ success: true, token, user, canLaunchAlpha: true, hwidMismatch });
+        return res.json({ success: true, token, user, canLaunchAlpha: true });
 
     } catch (err) {
         console.error('[/login]', err);
