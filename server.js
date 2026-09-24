@@ -67,7 +67,7 @@ function mapUser(row) {
         roleColor:          roleColor(row.role ?? 'user', row.username),
         prefix:             row.prefix       ?? '',
         prefixColor:        row.prefix_color ?? '',
-        hwid:               '',
+        hwid:               row.hwid ?? '',
         subscriptionType:   row.subscription_type ?? '',
         subscriptionExpiresAt: row.subscription_expires_at ? new Date(row.subscription_expires_at).toISOString() : '',
         subscriptionActive: isSubActive(row),
@@ -113,15 +113,16 @@ app.get('/client/download', async (req, res) => {
     return res.redirect(302, CLIENT_DOWNLOAD_URL);
 });
 
-async function ensureColumns() {
+async function ensureHwidColumn() {
     try {
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS hwid TEXT`);
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS prefix TEXT DEFAULT ''`);
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS prefix_color TEXT DEFAULT ''`);
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_type VARCHAR(50)`);
         await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_expires_at TIMESTAMPTZ`);
-    } catch (e) { console.warn('[DB] ensure columns failed:', e.message); }
+    } catch (e) { console.warn('[HWID] ensure column failed:', e.message); }
 }
-ensureColumns();
+ensureHwidColumn();
 
 function cryptoKey(name, bytes) {
     try {
@@ -161,20 +162,41 @@ app.get('/crypto/config-key', async (req, res) => {
 app.get('/crypto/ndl-key', async (req, res) => {
     return res.json({ success: true, key: NDL_KEY.toString('base64') });
 });
-// HWID удалён: старые клиенты ещё могут слать hwid и дёргать /hwid/verify.
-// Держим совместимый стаб, всегда успешный, чтобы их не блочило до обновления.
+function normalizeHwid(h) {
+    return String(h || '').trim().toUpperCase().replace(/[^A-Z0-9-]/g, '').slice(0, 128);
+}
+
 app.post('/hwid/verify', async (req, res) => {
-    const { token } = req.body ?? {};
+    const { token, hwid } = req.body ?? {};
+    const hw = normalizeHwid(hwid);
     if (!token) return res.status(400).json({ success: false, error: 'SESSION_EXPIRED' });
+    if (!hw || hw.length < 8) return res.status(400).json({ success: false, error: 'BAD_HWID' });
+    const client = await pool.connect();
     try {
-        const row = await verifyToken(String(token));
-        if (!row) return res.status(401).json({ success: false, error: 'SESSION_EXPIRED' });
+        const { rows } = await client.query(`SELECT * FROM users WHERE session_token=$1 LIMIT 1`, [token]);
+        if (rows.length === 0) return res.status(401).json({ success: false, error: 'SESSION_EXPIRED' });
+        const row = rows[0];
+        if (!row.session_expires_at || new Date(row.session_expires_at) < new Date())
+            return res.status(401).json({ success: false, error: 'SESSION_EXPIRED' });
         if (isBanned(row)) return res.json({ success: false, error: 'BANNED' });
-        return res.json({ success: true, bound: true, firstBind: false, user: mapUser(row) });
+        const stored = normalizeHwid(row.hwid);
+        if (!stored) {
+            
+            await client.query(`UPDATE users SET hwid=$1 WHERE id=$2`, [hw, row.id]);
+            return res.json({ success: true, bound: true, firstBind: true, user: mapUser({ ...row, hwid: hw }) });
+        }
+        if (stored === hw) {
+            return res.json({ success: true, bound: true, firstBind: false, user: mapUser(row) });
+        }
+        return res.status(403).json({
+            success: false,
+            error: 'HWID_MISMATCH',
+            message: 'Аккаунт привязан к другому устройству. Запуск невозможен.',
+        });
     } catch (e) {
-        console.error('[/hwid/verify-stub]', e);
+        console.error('[/hwid/verify]', e);
         return res.status(500).json({ success: false, error: 'SERVER_ERROR' });
-    }
+    } finally { client.release(); }
 });
 
 app.post('/profile', async (req, res) => {
@@ -319,8 +341,7 @@ async function verifyTokenAlpha(token){
 setInterval(()=>{ const now=Date.now(); for(const [k,arr] of rateMap){ const f=arr.filter(t=>now-t<SPAM_WINDOW_MS); if(f.length===0) rateMap.delete(k); else rateMap.set(k,f);} }, 30_000);
 
 app.post('/login', async (req, res) => {
-    const { login, password } = req.body ?? {};
-    // NOTE: поле hwid от старых клиентов игнорируется (привязки к устройству больше нет).
+    const { login, password, hwid } = req.body ?? {};
 
     if (!login || !password) {
         return res.status(400).json({ success: false, error: 'WRONG_CREDENTIALS' });
@@ -353,12 +374,40 @@ app.post('/login', async (req, res) => {
         const token     = generateToken();
         const expiresAt = new Date(Date.now() + 30 * 24 * 3600 * 1000);
 
-        await client.query(
-            `UPDATE users SET session_token=$1, session_expires_at=$2 WHERE id=$3`,
-            [token, expiresAt, row.id]
-        );
+        
+        
+        const hw = normalizeHwid(hwid);
+        // Чужой HWID -> отказ ДО выдачи токена (иначе в БД останется валидная сессия).
+        // Первый вход (stored пуст) -> привязка ниже.
+        const storedHw = normalizeHwid(row.hwid);
+        if (hw && hw.length >= 8 && storedHw && storedHw !== hw) {
+            return res.status(403).json({
+                success: false,
+                error: 'HWID_MISMATCH',
+                message: 'Аккаунт привязан к другому устройству. Запуск невозможен.',
+            });
+        }
+        let effectiveRow = row;
+        try {
+            if (hw && hw.length >= 8) {
+                if (!storedHw) {
+                    await client.query(`UPDATE users SET session_token=$1, session_expires_at=$2, hwid=$3 WHERE id=$4`, [token, expiresAt, hw, row.id]);
+                    effectiveRow = { ...row, hwid: hw, session_token: token };
+                } else {
+                    await client.query(`UPDATE users SET session_token=$1, session_expires_at=$2 WHERE id=$3`, [token, expiresAt, row.id]);
+                    effectiveRow = { ...row, session_token: token };
+                }
+            } else {
+                await client.query(
+                    `UPDATE users SET session_token=$1, session_expires_at=$2 WHERE id=$3`,
+                    [token, expiresAt, row.id]
+                );
+            }
+        } catch (_) {
+            await client.query(`UPDATE users SET session_token=$1, session_expires_at=$2 WHERE id=$3`, [token, expiresAt, row.id]);
+        }
 
-        const user = mapUser({ ...row, session_token: token });
+        const user = mapUser(effectiveRow);
         return res.json({ success: true, token, user, canLaunchAlpha: true });
 
     } catch (err) {
