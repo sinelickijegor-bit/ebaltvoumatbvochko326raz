@@ -89,7 +89,7 @@ function fileNameFromUrl(url, fallback) {
 const CLIENT_DOWNLOAD_URL =
     process.env.CLIENT_DOWNLOAD_URL ||
     'https://github.com/claudeclaudeclaude6725-eng/NoryxLoader/releases/download/obnova/NoryxDLC-1.0.0-obf.jar';
-const CLIENT_VERSION   = process.env.CLIENT_VERSION   || '1.0.0-obf-1';
+const CLIENT_VERSION   = process.env.CLIENT_VERSION   || '1.4';
 const CLIENT_FILE_NAME = process.env.CLIENT_FILE_NAME || fileNameFromUrl(process.env.CLIENT_DOWNLOAD_URL || 'https://github.com/claudeclaudeclaude6725-eng/NoryxLoader/releases/download/obnova/NoryxDLC-1.0.0-obf.jar', 'client.jar');
 const CLIENT_UPDATED_AT = process.env.CLIENT_UPDATED_AT || new Date().toISOString();
 
